@@ -2,6 +2,7 @@ use std::env::args;
 use std::fs::File;
 use std::io::*;
 use std::path::Path;
+use std::ffi::OsStr;
 
 fn read_data<P: AsRef<Path>>(path: P) -> Result<Vec<u8>> {
     let mut file = try!(File::open(&path));
@@ -185,19 +186,121 @@ fn dump_model_file(data: Vec<u8>, mut offset: usize) {
             }
         }
 
+        let materialListHeader: &BSSectionHeader = mutate::<&BSSectionHeader>(&data, &offset);
+        offset += std::mem::size_of::<BSSectionHeader>();
+        
+        offset += std::mem::size_of::<BSSectionHeader>(); // Ignore the structure header..
+
+        let materialList: &BSMaterialList = mutate::<&BSMaterialList>(&data, &offset);
+        offset += std::mem::size_of::<BSMaterialList>();
+
+        println!("  Material List Data");
+        println!("  Materials = {:?}", materialList.nummaterials);
+
+		// Skip over the per-material byte values that I don't know what do.
+		offset += (std::mem::size_of::<u32>() as u32 * materialList.nummaterials) as usize;
+		
+		for _ in 0..materialList.nummaterials {
+            let materialHeader: &BSSectionHeader = mutate::<&BSSectionHeader>(&data, &offset);
+            offset += std::mem::size_of::<BSSectionHeader>();
+			
+            let secbase: usize = offset;
+			offset += std::mem::size_of::<BSSectionHeader>();
+
+            let material: &BSMaterial = mutate::<&BSMaterial>(&data, &offset);
+            offset += std::mem::size_of::<BSMaterial>();
+
+            println!("  Material Data");
+			println!("  Textures = {:?}", material.numtextures);
+            println!("  Color = {:#?}", material.color);
+			
+			for _ in 0..material.numtextures {
+                let textureHeader: &BSSectionHeader = mutate::<&BSSectionHeader>(&data, &offset);
+                offset += std::mem::size_of::<BSSectionHeader>();
+				
+                let texsecbase: usize = offset;
+				offset += std::mem::size_of::<BSSectionHeader>();
+				
+                let texture: &BSTexture = mutate::<&BSTexture>(&data, &offset);
+                offset += std::mem::size_of::<BSTexture>();
+				
+                let nameHeader: &BSSectionHeader = mutate::<&BSSectionHeader>(&data, &offset);
+                offset += std::mem::size_of::<BSSectionHeader>();
+
+				offset += nameHeader.size as usize;
+                let alphaHeader: &BSSectionHeader = mutate::<&BSSectionHeader>(&data, &offset);
+                offset += std::mem::size_of::<BSSectionHeader>();
+				
+                println!("  Texture Data");
+				
+				offset = texsecbase + textureHeader.size as usize;
+			}
+			offset = secbase + materialHeader.size as usize;
+		}
+
         // Jump to the start of the next geometry
         offset = base_data + geom_header.size as usize;
     }
 }
 
+fn dump_texture_dictionary(data: Vec<u8>, mut offset: usize) {
+    let header: &BSSectionHeader = mutate::<&BSSectionHeader>(&data, &offset);
+    offset += std::mem::size_of::<BSSectionHeader>();
+
+    println!("ID = {:?} (IsTextureDirectory =  {:?})", header.id, header.id == RW::SidTextureDictionary as u32);
+    println!("Size = {:?} bytes", header.size);
+    println!("Version ID = {:x?}", header.versionid);
+	
+	offset += std::mem::size_of::<BSSectionHeader>();
+
+    let dir: &BSTextureDictionary = mutate::<&BSTextureDictionary>(&data, &offset);
+    offset += std::mem::size_of::<BSTextureDictionary>();
+
+    println!("Texture Count = {:x?}", dir.numtextures);
+	
+	for _ in 0..dir.numtextures {
+        let textureHeader: &BSSectionHeader = mutate::<&BSSectionHeader>(&data, &offset);
+        offset += std::mem::size_of::<BSSectionHeader>();
+		
+        let basloc: usize = offset;
+		
+		offset += std::mem::size_of::<BSSectionHeader>();
+
+        let native: &BSTextureNative = mutate::<&BSTextureNative>(&data, &offset);
+        offset += std::mem::size_of::<BSTextureNative>();
+		
+        println!("Texture Info");
+        println!(" Width = {:?}", native.width);
+        println!(" Height = {:?}", native.height);
+        println!(" UV Wrap = {:x?} / {:x?}", native.wrapU, native.wrapV);
+        println!(" Format = {:x?}", native.rasterformat);
+        println!(" Name = {:?}", native.diffuseName);
+        println!(" Alpha = {:?}", native.alphaName);
+		
+		offset = basloc + textureHeader.size as usize;
+	}
+}
+
 fn main() {
     let path = args().nth(1).unwrap();
+
+    let copy_path = args().nth(1).unwrap();
+
+    let ext = Path::new(&copy_path).extension().and_then(OsStr::to_str);
 
     let data = read_data(path).unwrap();
 
     let offset = 0;
 
-    dump_model_file(data, offset);
+    if ext == Some("dff") || ext == Some("DFF") {
+        println!("Dumping model file");
+        dump_model_file(data, offset);
+    } else if ext == Some("txd") || ext == Some("TXD") {
+        println!("Dumping texture archive");
+        dump_texture_dictionary(data, offset);
+    } else {
+        println!("I'm not sure what that is");
+    }
 }
 
 enum RW {
@@ -212,6 +315,8 @@ enum RW {
     SidFrameList = 0x000E,
     SidGeometry = 0x000F,
     SidClump = 0x0010,
+
+    SidTextureDictionary = 0x0016,
 
     SidGeometryList = 0x001A,
 
@@ -316,4 +421,88 @@ struct BSGeometryBounds {
     radius: f32,
     positions: u32,
     normals: u32,
+}
+
+struct BSMaterialList
+{
+    nummaterials: u32,
+}
+
+struct BSMaterial
+{
+    unknown: u32,
+    color: BSColor,
+    alsounknown: u32,
+    numtextures: u32,
+    ambient: f32,
+    specular: f32,
+    diffuse: f32,
+}
+
+struct BSTexture
+{
+    filterflags: u16,
+    unknown: u16,
+}
+
+/**
+ * Texture Dictionary Structures (TXD)
+ */
+struct BSTextureDictionary
+{
+    numtextures: u16,
+    unknown: u16,
+}
+
+struct BSTextureNative
+{
+    platform: u32,
+    filterflags: u16,
+    wrapV: u8,
+    wrapU: u8,
+    diffuseName: [char; 32], 
+    alphaName: [char; 32],
+    rasterformat: u32,
+    alpha: u32,
+    width: u16,
+    height: u16,
+    bpp: u8,
+    nummipmaps: u8,
+    rastertype: u8,
+    dxttype: u8,
+    datasize: u32,
+}
+
+enum Filter {
+    FILTER_NONE = 0x0,
+    FILTER_NEAREST = 0x01,
+    FILTER_LINEAR = 0x02,
+    FILTER_MIP_NEAREST = 0x03,
+    FILTER_MIP_LINEAR = 0x04,
+    FILTER_LINEAR_MIP_NEAREST = 0x05,
+    FILTER_LINEAR_MIP_LINEAR = 0x06,
+    FILTER_MYSTERY_OPTION = 0x1101
+}
+
+enum Wrap {
+    WRAP_NONE = 0x00,
+    WRAP_WRAP  = 0x01,
+    WRAP_MIRROR = 0x02,
+    WRAP_CLAMP = 0x03
+}
+
+enum Format {
+    FORMAT_DEFAULT = 0x0000, // helpful
+    FORMAT_1555    = 0x0100, // Alpha 1, RGB 5 b
+    FORMAT_565     = 0x0200, // 5r6g5b
+    FORMAT_4444    = 0x0300, // 4 bits each
+    FORMAT_LUM8    = 0x0400, // Greyscale
+    FORMAT_8888    = 0x0500, // 8 bits each
+    FORMAT_888     = 0x0600, // RGB 8 bits each
+    FORMAT_555     = 0x0A00, // do not use
+    
+    FORMAT_EXT_AUTO_MIPMAP = 0x1000, // Generate mipmaps
+    FORMAT_EXT_PAL8        = 0x2000, // 256 colour palette
+    FORMAT_EXT_PAL4        = 0x4000, // 16 color palette
+    FORMAT_EXT_MIPMAP      = 0x8000 // Mipmaps included
 }
